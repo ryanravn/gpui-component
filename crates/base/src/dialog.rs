@@ -544,6 +544,8 @@ impl RenderOnce for Dialog {
                         let request_close = request_close.clone();
                         this.child(
                             div()
+                                .absolute()
+                                .size_full()
                                 .on_any_mouse_down(move |event, window, cx| {
                                     if event.position.y < dismiss_below_y {
                                         return;
@@ -614,6 +616,41 @@ mod tests {
         assert_eq!(
             &*changes.borrow(),
             &[(true, DialogChangeReason::TriggerPress)]
+        );
+    }
+
+    struct BackdropHarness {
+        handle: DialogHandle,
+    }
+    impl Render for BackdropHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            Dialog::new(cx)
+                .handle(self.handle.clone())
+                .backdrop(div().absolute().size_full())
+                .popup(div().size(px(100.)).occlude())
+        }
+    }
+
+    #[gpui::test]
+    fn backdrop_press_closes_and_reports_reason(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let handle = DialogHandle::new(true);
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        *handle.on_open_change.borrow_mut() = Some({
+            let changes = changes.clone();
+            Rc::new(move |open, reason, _, _| changes.borrow_mut().push((open, reason)))
+        });
+        let (_, cx) = cx.add_window_view({
+            let handle = handle.clone();
+            move |_, _| BackdropHarness { handle }
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_click(point(px(300.), px(300.)), Default::default());
+
+        assert!(!handle.is_open());
+        assert_eq!(
+            &*changes.borrow(),
+            &[(false, DialogChangeReason::BackdropPress)]
         );
     }
 }
