@@ -78,6 +78,13 @@ impl FoldMap {
         self.folded.is_empty() && self.blocks.is_empty()
     }
 
+    /// Whether anything is hidden at all, which is when the projection has to
+    /// be built rather than left as the identity.
+    #[inline]
+    pub(super) fn hides_anything(&self) -> bool {
+        !self.nothing_hidden()
+    }
+
     /// Update cached wrap_row_count without full rebuild.
     /// Used when no folds are active (identity mapping assumed).
     pub(super) fn mark_dirty_with_wrap_count(&mut self, wrap_row_count: usize) {

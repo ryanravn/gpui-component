@@ -283,10 +283,10 @@ impl DisplayMap {
     /// Rebuild fold projection after wrap_map or fold state changes
     /// Only rebuilds if there are actually folded ranges
     fn rebuild_fold_projection(&mut self) {
-        if !self.fold_map.folded_ranges().is_empty() {
+        if self.fold_map.hides_anything() {
             self.fold_map.rebuild(&self.wrap_map);
         } else {
-            // No active folds: identity mapping (wrap_row == display_row).
+            // Nothing hidden: identity mapping (wrap_row == display_row).
             // Just update cached count so query methods work without Vec allocation.
             self.fold_map
                 .mark_dirty_with_wrap_count(self.wrap_map.wrap_row_count());

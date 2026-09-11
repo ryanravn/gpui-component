@@ -413,6 +413,10 @@ struct LaidOutBlock {
     element: AnyElement,
     display_row: usize,
     height: Pixels,
+    /// Whether it was placed for this frame. A block above the window is
+    /// measured, because the rows after it move by its height, but it is not
+    /// drawn and so is never prepainted.
+    placed: bool,
 }
 
 impl<M: InputModeKind> TextElement<M> {
@@ -1796,6 +1800,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 element,
                 display_row,
                 height,
+                placed: false,
             });
         }
         laid_out.sort_by_key(|block| block.display_row);
@@ -2060,6 +2065,45 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds, cx);
 
+        // An element may only prepaint in this phase, so the blocks are placed
+        // here rather than while painting, walking the rows the same way the
+        // paint loop does.
+        {
+            let block_x = bounds.origin.x + line_number_width;
+            let mut offset_y = last_layout.visible_top;
+            let mut next_block = 0;
+            for (index, line) in last_layout.lines.iter().enumerate() {
+                let display_row = last_layout.visible_display_rows[index];
+                while laid_out
+                    .get(next_block)
+                    .is_some_and(|block| block.display_row < display_row)
+                {
+                    next_block += 1;
+                }
+                while let Some(block) = laid_out.get_mut(next_block) {
+                    if block.display_row != display_row {
+                        break;
+                    }
+                    block.element.prepaint_at(
+                        point(block_x, bounds.origin.y + offset_y),
+                        window,
+                        cx,
+                    );
+                    block.placed = true;
+                    offset_y += block.height;
+                    next_block += 1;
+                }
+                offset_y += line.size(line_height).height;
+            }
+            for block in laid_out.iter_mut().skip(next_block) {
+                block
+                    .element
+                    .prepaint_at(point(block_x, bounds.origin.y + offset_y), window, cx);
+                block.placed = true;
+                offset_y += block.height;
+            }
+        }
+
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
             let mut line_numbers = Vec::with_capacity(last_layout.visible_buffer_lines.len());
@@ -2290,9 +2334,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 px(0.)
             };
 
-            let mut blocks = std::mem::take(&mut prepaint.blocks);
-            let mut next_block = 0;
-            let block_x = origin.x + prepaint.last_layout.line_number_width;
             for (index, (line, &buffer_line)) in prepaint
                 .last_layout
                 .lines
@@ -2301,27 +2342,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .enumerate()
             {
                 let row = buffer_line;
-                let display_row = prepaint.last_layout.visible_display_rows[index];
-                // Blocks above the window were measured for the rows they
-                // move, not to be drawn; the ones at this row are drawn now,
-                // in the space the line layout left for them.
-                while blocks
-                    .get(next_block)
-                    .is_some_and(|block| block.display_row < display_row)
-                {
-                    next_block += 1;
-                }
-                while let Some(block) = blocks.get_mut(next_block) {
-                    if block.display_row != display_row {
-                        break;
-                    }
-                    block
-                        .element
-                        .prepaint_at(point(block_x, origin.y + offset_y), window, cx);
-                    block.element.paint(window, cx);
-                    offset_y += block.height;
-                    next_block += 1;
-                }
+                offset_y += prepaint.last_layout.block_space_at(index);
                 let line_y = origin.y + offset_y;
                 let p = point(
                     origin.x + prepaint.last_layout.line_number_width + (scroll_offset),
@@ -2374,14 +2395,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 }
             }
 
-            // A note that ends in a rendered block has no line after it to
-            // hang the block on, so what is left over is drawn here.
-            for block in blocks.iter_mut().skip(next_block) {
-                block
-                    .element
-                    .prepaint_at(point(block_x, origin.y + offset_y), window, cx);
+            for block in prepaint.blocks.iter_mut().filter(|block| block.placed) {
                 block.element.paint(window, cx);
-                offset_y += block.height;
             }
 
             // Paint blinking cursor
