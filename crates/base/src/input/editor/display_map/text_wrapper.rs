@@ -8,8 +8,9 @@ use ropey::Rope;
 use smallvec::SmallVec;
 use sum_tree::{Bias, Dimensions, SumTree};
 
+use super::TextProjection;
 use crate::input::{
-    Point as TreeSitterPoint, RopeExt,
+    EditorLineStyle, EditorPresentation, Point as TreeSitterPoint, RopeExt,
     layout::{LastLayout, WhitespaceIndicators},
 };
 
@@ -37,6 +38,8 @@ pub(crate) struct LineItem {
     ///
     /// Not contains the line end `\n`.
     pub(crate) wrapped_lines: SmallVec<[Range<usize>; 1]>,
+    pub(crate) projection: TextProjection,
+    pub(crate) style: Option<EditorLineStyle>,
 }
 
 impl LineItem {
@@ -145,6 +148,7 @@ pub(crate) struct TextWrapper {
     /// If is none, it means the text is not wrapped
     wrap_width: Option<Pixels>,
     wrapping_indent: WrappingIndent,
+    presentation: EditorPresentation,
     /// The lines by split \n
     pub(crate) lines: SumTree<LineItem>,
 
@@ -160,6 +164,7 @@ impl TextWrapper {
             font_size,
             wrap_width,
             wrapping_indent: WrappingIndent::default(),
+            presentation: EditorPresentation::default(),
             lines: SumTree::new(&()),
             _initialized: false,
         }
@@ -263,6 +268,29 @@ impl TextWrapper {
         self.update_all(&self.text.clone(), cx);
     }
 
+    pub(crate) fn presentation(&self) -> &EditorPresentation {
+        &self.presentation
+    }
+
+    pub(crate) fn adjust_presentation_for_edit(&mut self, range: &Range<usize>, new_text: &Rope) {
+        self.presentation
+            .adjust_for_edit(&self.text, range, new_text);
+    }
+
+    pub(crate) fn set_presentation(
+        &mut self,
+        mut presentation: EditorPresentation,
+        cx: &mut App,
+    ) -> bool {
+        presentation.normalize();
+        if self.presentation == presentation {
+            return false;
+        }
+        self.presentation = presentation;
+        self.update_all(&self.text.clone(), cx);
+        true
+    }
+
     pub(crate) fn prepare_if_need(&mut self, text: &Rope, cx: &mut App) -> bool {
         if self._initialized {
             return false;
@@ -288,19 +316,30 @@ impl TextWrapper {
         new_text: &Rope,
         cx: &mut App,
     ) {
+        let font = self.font.clone();
+        let font_size = self.font_size;
         let mut line_wrapper = cx
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
-        self._update(
-            changed_text,
-            range,
-            new_text,
-            &mut |line_str, wrap_width| {
+        self._update(changed_text, range, new_text, &mut |line_str,
+                                                          wrap_width,
+                                                          style: Option<
+            &EditorLineStyle,
+        >| {
+            if let Some(style) = style {
+                cx.text_system()
+                    .line_wrapper(
+                        style.font(font.clone()),
+                        style.font_size().unwrap_or(font_size),
+                    )
+                    .wrap_line(&[LineFragment::text(line_str)], wrap_width)
+                    .collect()
+            } else {
                 line_wrapper
                     .wrap_line(&[LineFragment::text(line_str)], wrap_width)
                     .collect()
-            },
-        );
+            }
+        });
     }
 
     fn _update<F>(
@@ -310,7 +349,7 @@ impl TextWrapper {
         new_text: &Rope,
         wrap_line: &mut F,
     ) where
-        F: FnMut(&str, Pixels) -> Vec<gpui::Boundary>,
+        F: FnMut(&str, Pixels, Option<&EditorLineStyle>) -> Vec<gpui::Boundary>,
     {
         // Remove the old changed lines.
         let buffer_line_count = self.lines_count();
@@ -332,8 +371,19 @@ impl TextWrapper {
         let wrap_width = self.wrap_width;
 
         // line not contains `\n`.
-        for line in Rope::from(changed_text.slice(new_range)).iter_lines() {
+        for (index, line) in Rope::from(changed_text.slice(new_range))
+            .iter_lines()
+            .enumerate()
+        {
             let line_str = line.to_string();
+            let row = new_start_row + index;
+            let projection = TextProjection::new(
+                &line_str,
+                changed_text.line_start_offset(row),
+                self.presentation.concealed_ranges(),
+            );
+            let visible = projection.text(&line_str);
+            let style = self.presentation.line(row).cloned();
             let mut wrapped_lines = SmallVec::<[Range<usize>; 1]>::new();
             let mut prev_boundary_ix = 0;
             let mut indent_chars = 0;
@@ -344,23 +394,27 @@ impl TextWrapper {
                     WrappingIndent::Same => {
                         // Here only have wrapped line, if there is no wrap meet, the `line_wraps`
                         // result will empty.
-                        for boundary in wrap_line(&line_str, wrap_width) {
-                            wrapped_lines.push(prev_boundary_ix..boundary.ix);
-                            prev_boundary_ix = boundary.ix;
+                        for boundary in wrap_line(&visible, wrap_width, style.as_ref()) {
+                            let source_ix = projection.source_offset(boundary.ix);
+                            wrapped_lines.push(prev_boundary_ix..source_ix);
+                            prev_boundary_ix = source_ix;
                             indent_chars = boundary.next_indent;
                         }
                     }
                     WrappingIndent::None => {
                         // The first visual line keeps the line's leading indentation, so it is
                         // wrapped as is.
-                        let bondaries = wrap_line(&line_str, wrap_width);
+                        let bondaries = wrap_line(&visible, wrap_width, style.as_ref());
                         if let Some(first) = bondaries.first() {
                             let first_ix = first.ix;
-                            wrapped_lines.push(prev_boundary_ix..first_ix);
-                            prev_boundary_ix = first_ix;
+                            let source_ix = projection.source_offset(first_ix);
+                            wrapped_lines.push(prev_boundary_ix..source_ix);
+                            prev_boundary_ix = source_ix;
 
-                            for boundary in wrap_line(&line_str[first_ix..], wrap_width) {
-                                let ix = first_ix + boundary.ix;
+                            for boundary in
+                                wrap_line(&visible[first_ix..], wrap_width, style.as_ref())
+                            {
+                                let ix = projection.source_offset(first_ix + boundary.ix);
                                 wrapped_lines.push(prev_boundary_ix..ix);
                                 prev_boundary_ix = ix;
                             }
@@ -378,6 +432,8 @@ impl TextWrapper {
                 len: line.len(),
                 indent: indent_chars,
                 wrapped_lines,
+                projection,
+                style,
             });
         }
 
@@ -511,6 +567,8 @@ pub(crate) struct LineLayout {
     pub(crate) whitespace_indicators: Option<WhitespaceIndicators>,
     /// Whitespace indicators: (line_index, x_position, is_tab)
     pub(crate) whitespace_chars: Vec<(usize, Pixels, bool)>,
+    projection: Option<TextProjection>,
+    row_height: Option<Pixels>,
 }
 
 impl LineLayout {
@@ -522,6 +580,8 @@ impl LineLayout {
             wrap_indent: px(0.),
             whitespace_chars: Vec::new(),
             whitespace_indicators: None,
+            projection: None,
+            row_height: None,
         }
     }
 
@@ -529,6 +589,27 @@ impl LineLayout {
     pub(crate) fn wrap_indent(mut self, wrap_indent: Pixels) -> Self {
         self.wrap_indent = wrap_indent;
         self
+    }
+
+    pub(crate) fn with_projection(mut self, projection: TextProjection) -> Self {
+        self.len = projection.source_len();
+        self.projection = Some(projection);
+        self
+    }
+
+    pub(crate) fn with_row_height(mut self, height: Option<Pixels>) -> Self {
+        self.row_height = height;
+        self
+    }
+
+    pub(crate) fn row_height(&self, default: Pixels) -> Pixels {
+        self.row_height.unwrap_or(default)
+    }
+
+    fn source_offset(&self, display: usize) -> usize {
+        self.projection
+            .as_ref()
+            .map_or(display, |projection| projection.source_offset(display))
     }
 
     /// The pixel indent applied to the given visual line, relative to the line's
@@ -603,6 +684,13 @@ impl LineLayout {
         last_layout: &LastLayout,
         line_end_affinity: bool,
     ) -> Option<Point<Pixels>> {
+        if offset > self.len {
+            return None;
+        }
+        let offset = self
+            .projection
+            .as_ref()
+            .map_or(offset, |projection| projection.display_offset(offset));
         let mut acc_len = 0;
         let mut offset_y = px(0.);
 
@@ -632,7 +720,7 @@ impl LineLayout {
             // Always advance by actual line length. The last line gets +1 so the
             // cursor can be placed after the final character.
             acc_len += if is_last { line.len + 1 } else { line.len };
-            offset_y += last_layout.line_height;
+            offset_y += self.row_height(last_layout.line_height);
         }
 
         None
@@ -655,12 +743,12 @@ impl LineLayout {
                     ix = ix.saturating_sub(c_len);
                 }
 
-                return acc_len + ix;
+                return self.source_offset(acc_len + ix);
             }
             acc_len += line.text.len();
         }
 
-        acc_len
+        self.source_offset(acc_len)
     }
 
     /// Get the index for the given position (x, y) in this line layout.
@@ -677,7 +765,7 @@ impl LineLayout {
         let x_offset = last_layout.alignment_offset(self.longest_width);
         for (i, line) in self.wrapped_lines.iter().enumerate() {
             let is_last = i + 1 == self.wrapped_lines.len();
-            let line_bottom = line_top + last_layout.line_height;
+            let line_bottom = line_top + self.row_height(last_layout.line_height);
             if pos.y >= line_top && pos.y < line_bottom {
                 let mut ix = line.closest_index_for_x(pos.x - x_offset - self.line_indent(i));
                 if !is_last && ix == line.text.len() {
@@ -685,7 +773,7 @@ impl LineLayout {
                     let c_len = line.text.chars().last().map(|c| c.len_utf8()).unwrap_or(0);
                     ix = ix.saturating_sub(c_len);
                 }
-                return Some(offset + ix);
+                return Some(self.source_offset(offset + ix));
             }
 
             offset += line.text.len();
@@ -704,10 +792,10 @@ impl LineLayout {
         let mut line_top = px(0.);
         let x_offset = last_layout.alignment_offset(self.longest_width);
         for (i, line) in self.wrapped_lines.iter().enumerate() {
-            let line_bottom = line_top + last_layout.line_height;
+            let line_bottom = line_top + self.row_height(last_layout.line_height);
             if pos.y >= line_top && pos.y < line_bottom {
                 let ix = line.index_for_x(pos.x - x_offset - self.line_indent(i))?;
-                return Some(offset + ix);
+                return Some(self.source_offset(offset + ix));
             }
 
             offset += line.text.len();
@@ -718,6 +806,7 @@ impl LineLayout {
     }
 
     pub(crate) fn size(&self, line_height: Pixels) -> Size<Pixels> {
+        let line_height = self.row_height(line_height);
         let width = self
             .wrapped_lines
             .iter()
@@ -737,6 +826,7 @@ impl LineLayout {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let line_height = self.row_height(line_height);
         for (ix, line) in self.wrapped_lines.iter().enumerate() {
             _ = line.paint(
                 pos + point(self.line_indent(ix), ix * line_height),
@@ -776,6 +866,31 @@ mod tests {
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
 
     #[test]
+    fn concealed_wraps_keep_the_original_byte_positions() {
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(100.)));
+        let text = Rope::from("**æøå** rest");
+        wrapper.presentation = EditorPresentation::new()
+            .with_concealed_ranges(vec![0..2, 8..10])
+            .with_line_styles(vec![EditorLineStyle::new(0..1).with_font_size(px(28.))]);
+        wrapper._update(&text, &(0..text.len()), &text, &mut |visible, _, style| {
+            assert_eq!(visible, "æøå rest");
+            assert_eq!(style.and_then(EditorLineStyle::font_size), Some(px(28.)));
+            vec![Boundary {
+                ix: 7,
+                next_indent: 0,
+            }]
+        });
+        let line = wrapper.line(0).expect("wrapped line");
+        assert_eq!(line.wrapped_lines.as_slice(), [0..11, 11..15]);
+        assert_eq!(wrapper.offset_to_display_point(11).row, 1);
+        assert_eq!(
+            wrapper.display_point_to_offset(WrapDisplayPoint::new(1, 0, 0)),
+            11
+        );
+        assert_eq!(wrapper.text().to_string(), "**æøå** rest");
+    }
+
+    #[test]
     fn test_update() {
         let font = gpui::Font {
             family: "Arial".into(),
@@ -790,7 +905,11 @@ mod tests {
             "Hello, 世界!\r\nThis is second line.\nThis is third line.\n这里是第 4 行。",
         );
 
-        fn fake_wrap_line(_line: &str, _wrap_width: Pixels) -> Vec<Boundary> {
+        fn fake_wrap_line(
+            _line: &str,
+            _wrap_width: Pixels,
+            _: Option<&EditorLineStyle>,
+        ) -> Vec<Boundary> {
             vec![]
         }
 
@@ -987,7 +1106,7 @@ mod tests {
     fn test_longest_row_after_shrink() {
         let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
         let mut text = Rope::from("aa\nthis is the longest line\nbb");
-        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _, _| vec![]);
         assert_eq!(wrapper.longest_row(), 1);
 
         // Shrink line 1 so line 2-equivalent isn't longest.
@@ -997,7 +1116,7 @@ mod tests {
         let range = start..end;
         let new_text = "a very very long first line now";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut |_, _| vec![]);
+        wrapper._update(&text, &range, &Rope::from(new_text), &mut |_, _, _| vec![]);
         assert_eq!(wrapper.longest_row(), 0);
     }
 
@@ -1006,7 +1125,7 @@ mod tests {
     fn test_edit_last_line_and_full_delete() {
         let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
         let mut text = Rope::from("one\ntwo\nthree");
-        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _, _| vec![]);
         assert_eq!(wrapper.lines_count(), 3);
 
         // Replace the last line only.
@@ -1014,14 +1133,14 @@ mod tests {
         let range = start..text.len();
         let new_text = "THREE EDITED";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut |_, _| vec![]);
+        wrapper._update(&text, &range, &Rope::from(new_text), &mut |_, _, _| vec![]);
         assert_eq!(wrapper.lines_count(), 3);
         assert_eq!(wrapper.line(2).unwrap().len(), "THREE EDITED".len());
 
         // Delete everything.
         let range = 0..text.len();
         text.replace(range.clone(), "");
-        wrapper._update(&text, &range, &Rope::from(""), &mut |_, _| vec![]);
+        wrapper._update(&text, &range, &Rope::from(""), &mut |_, _, _| vec![]);
         assert_eq!(wrapper.lines_count(), 1);
         assert_eq!(wrapper.len(), 1);
         assert_eq!(wrapper.line(0).unwrap().wrapped_lines.as_slice(), [0..0]);
@@ -1037,16 +1156,22 @@ mod tests {
                     len: 2,
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..2],
+                    projection: TextProjection::default(),
+                    style: None,
                 },
                 LineItem {
                     len: 4,
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..2, 2..4],
+                    projection: TextProjection::default(),
+                    style: None,
                 },
                 LineItem {
                     len: 1,
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..1],
+                    projection: TextProjection::default(),
+                    style: None,
                 },
             ],
             &(),
@@ -1076,7 +1201,7 @@ mod tests {
     fn test_wrap_row_queries_after_incremental_splice() {
         let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(10.)));
         let mut text = Rope::from("aa\nbbbb\nc");
-        let mut fake_wrap_line = |line: &str, _wrap_width: Pixels| {
+        let mut fake_wrap_line = |line: &str, _wrap_width: Pixels, _: Option<&EditorLineStyle>| {
             if line.len() > 2 {
                 vec![Boundary {
                     ix: 2,
@@ -1133,7 +1258,6 @@ mod tests {
 
         let last_layout = LastLayout {
             block_space: Vec::new(),
-            visible_display_rows: Vec::new(),
             placement: Default::default(),
             visible_range: 0..1,
             visible_buffer_lines: vec![0],
@@ -1178,24 +1302,32 @@ mod tests {
                     len: Rope::from("Hello, 世界!\r").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..15],
+                    projection: TextProjection::default(),
+                    style: None,
                 },
                 // range: 16..36
                 LineItem {
                     len: Rope::from("This is second line.\n").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..10, 10..20],
+                    projection: TextProjection::default(),
+                    style: None,
                 },
                 // range: 37..56
                 LineItem {
                     len: Rope::from("This is third line.\n").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..9, 9..15, 15..20],
+                    projection: TextProjection::default(),
+                    style: None,
                 },
                 // range: 57..79
                 LineItem {
                     len: Rope::from("这里是第 4 行。").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..22],
+                    projection: TextProjection::default(),
+                    style: None,
                 },
             ],
             &(),
@@ -1270,7 +1402,7 @@ mod tests {
         let mut wrapper = TextWrapper::new(test_font(), px(14.0), Some(px(10.)));
         wrapper.wrapping_indent = WrappingIndent::Same;
         let text = Rope::from("  abcdefghijklmnopqrstuv");
-        let mut fake_wrap_line = |line: &str, _wrap_width: Pixels| {
+        let mut fake_wrap_line = |line: &str, _wrap_width: Pixels, _: Option<&EditorLineStyle>| {
             if line.starts_with(' ') {
                 vec![Boundary {
                     ix: 5,
@@ -1302,7 +1434,7 @@ mod tests {
         let mut wrapper = TextWrapper::new(test_font(), px(14.0), Some(px(10.)));
         wrapper.wrapping_indent = WrappingIndent::None;
         let text = Rope::from("  abcdefghijklmnopqrstuv");
-        let mut fake_wrap_line = |line: &str, _wrap_width: Pixels| {
+        let mut fake_wrap_line = |line: &str, _wrap_width: Pixels, _: Option<&EditorLineStyle>| {
             if line.starts_with(' ') {
                 vec![Boundary {
                     ix: 5,
@@ -1341,7 +1473,6 @@ mod tests {
 
         let last_layout = LastLayout {
             block_space: Vec::new(),
-            visible_display_rows: Vec::new(),
             placement: Default::default(),
             visible_range: 0..1,
             visible_buffer_lines: vec![0],

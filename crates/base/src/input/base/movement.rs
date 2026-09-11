@@ -1,5 +1,6 @@
 use crate::input::InputModeKind;
 use gpui::{Context, Point, Window};
+use sum_tree::Bias;
 
 use crate::input::{
     InputBaseState, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
@@ -130,7 +131,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 if let Some(x) = line.closest_index_for_position(
                     Point {
                         x: preferred_x,
-                        y: next_display_point.local_row * last_layout.line_height,
+                        y: next_display_point.local_row * line.row_height(last_layout.line_height),
                     },
                     last_layout,
                 ) {
@@ -149,7 +150,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         } else {
             MoveDirection::Down
         };
-        self.move_to(new_offset, Some(direction), cx);
+        self.move_to(
+            self.text.clip_offset(new_offset, Bias::Left),
+            Some(direction),
+            cx,
+        );
         // Set back the preferred_column
         self.preferred_column = was_preferred_column;
         cx.notify();
@@ -219,12 +224,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
-        let Some(last_layout) = &self.last_layout else {
-            return;
-        };
-
-        let display_lines = (self.input_bounds.size.height / last_layout.line_height) as isize;
-        self.move_vertical(-display_lines, window, cx);
+        self.move_page(-1, window, cx);
     }
 
     pub(super) fn page_down(
@@ -237,12 +237,25 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
-        let Some(last_layout) = &self.last_layout else {
+        self.move_page(1, window, cx);
+    }
+
+    fn move_page(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(layout) = &self.last_layout else {
             return;
         };
-
-        let display_lines = (self.input_bounds.size.height / last_layout.line_height) as isize;
-        self.move_vertical(display_lines, window, cx);
+        let wrap = self.display_map.offset_to_wrap_display_point(self.cursor());
+        let row = self
+            .display_map
+            .wrap_row_to_display_row(wrap.row)
+            .unwrap_or_else(|| self.display_map.nearest_visible_display_row(wrap.row));
+        let y = layout.placement.y_of(row) + self.input_bounds.size.height * direction as f32;
+        let target = layout
+            .placement
+            .row_at(y)
+            .min(self.display_map.display_row_count().saturating_sub(1));
+        let delta = target as isize - row as isize;
+        self.move_vertical(if delta == 0 { direction } else { delta }, window, cx);
     }
 
     pub(super) fn home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {

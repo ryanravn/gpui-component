@@ -12,6 +12,7 @@ use ropey::Rope;
 use super::fold_map::FoldMap;
 use super::text_wrapper::{LineItem, TextWrapper, WrapDisplayPoint, WrappingIndent};
 use super::{BufferPoint, WrapPoint};
+use crate::input::EditorPresentation;
 use crate::input::RopeExt;
 
 /// WrapMap manages soft-wrapping and provides buffer ↔ wrap coordinate mapping.
@@ -107,6 +108,7 @@ impl WrapMap {
         new_text: &Rope,
         cx: &mut App,
     ) {
+        self.wrapper.adjust_presentation_for_edit(range, new_text);
         self.wrapper.update(changed_text, range, new_text, cx);
     }
 
@@ -123,6 +125,14 @@ impl WrapMap {
     /// Set font parameters
     pub(super) fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
         self.wrapper.set_font(font, font_size, cx);
+    }
+
+    pub(super) fn set_presentation(
+        &mut self,
+        presentation: EditorPresentation,
+        cx: &mut App,
+    ) -> bool {
+        self.wrapper.set_presentation(presentation, cx)
     }
 
     /// Ensure text is prepared (initializes wrapper if needed)

@@ -69,6 +69,7 @@ impl FoldMap {
             return false;
         }
         self.blocks = blocks;
+        self.block_wrap_rows.clear();
         self.needs_rebuild = true;
         true
     }
@@ -88,6 +89,7 @@ impl FoldMap {
     /// Update cached wrap_row_count without full rebuild.
     /// Used when no folds are active (identity mapping assumed).
     pub(super) fn mark_dirty_with_wrap_count(&mut self, wrap_row_count: usize) {
+        self.block_wrap_rows.clear();
         self.needs_rebuild = true;
         self.cached_wrap_row_count = wrap_row_count;
     }
@@ -248,6 +250,7 @@ impl FoldMap {
     #[inline]
     pub(super) fn clear_folds(&mut self) {
         self.folded.clear();
+        self.needs_rebuild = true;
     }
 
     /// Adjust folds and candidates after a text edit.
@@ -369,7 +372,6 @@ impl FoldMap {
             };
 
             if start_wrap_row < end_wrap_row {
-                self.block_wrap_rows.push(start_wrap_row..end_wrap_row);
                 hidden_ranges.push(start_wrap_row..end_wrap_row);
             }
         }

@@ -488,7 +488,10 @@ impl<M: InputModeKind> InputBaseState<M> {
     #[doc(hidden)]
     pub fn cursor_layout(&self) -> Option<(Bounds<Pixels>, Pixels)> {
         let layout = self.last_layout.as_ref()?;
-        Some((layout.cursor_bounds?, layout.line_height))
+        let row = self
+            .display_map
+            .buffer_line_to_display_row(self.text.offset_to_point(self.cursor()).row);
+        Some((layout.cursor_bounds?, layout.placement.row_height(row)))
     }
 
     pub fn input_bounds(&self) -> Bounds<Pixels> {
@@ -804,8 +807,10 @@ impl<M: InputModeKind> InputBaseState<M> {
             y_offset += last_layout.block_space_at(vi);
             let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
             let local_offset = offset.saturating_sub(prev_lines_offset);
-            if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
-                let sub_line_index = (pos.y / line_height) as usize;
+            if offset >= prev_lines_offset
+                && let Some(pos) = line.position_for_index(local_offset, last_layout, false)
+            {
+                let sub_line_index = (pos.y / line.row_height(line_height)) as usize;
                 let adjusted_pos = point(pos.x + last_layout.line_number_width, pos.y + y_offset);
                 return (vi, sub_line_index, Some(adjusted_pos));
             }
@@ -1853,11 +1858,9 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let row = point.row;
 
-        // Calculate row offset by multiplying the number of lines before it with the line height
-        let mut row_offset_y = last_layout.placement.y_of(
-            self.display_map.buffer_line_to_display_row(row),
-            line_height,
-        );
+        let mut row_offset_y = last_layout
+            .placement
+            .y_of(self.display_map.buffer_line_to_display_row(row));
 
         // For Right alignment use 0 margin: the cursor indicator is clamped inside bounds
         // in layout_cursor, so shifting the text here would cause a first-click visual jump.
@@ -1866,10 +1869,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             TextAlign::Right => px(0.),
             TextAlign::Center => last_layout.cursor_size.width,
         };
-        if let Some(line) = last_layout
-            .lines
-            .get(row.saturating_sub(last_layout.visible_range.start))
-        {
+        if let Some(line) = last_layout.line(row) {
             // Check to scroll horizontally and soft wrap lines
             if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
                 let bounds_width = bounds.size.width - last_layout.line_number_width;
@@ -2564,10 +2564,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         let Some(end_pos) = end_pos else {
             return None;
         };
+        let height = last_layout
+            .line(
+                self.text
+                    .offset_to_point(range.end.min(self.text.len()))
+                    .row,
+            )
+            .map_or(last_layout.line_height, |line| {
+                line.row_height(last_layout.line_height)
+            });
 
         Some(Bounds::from_corners(
             last_bounds.origin + start_pos,
-            last_bounds.origin + end_pos + point(px(0.), last_layout.line_height),
+            last_bounds.origin + end_pos + point(px(0.), height),
         ))
     }
 
@@ -2929,6 +2938,9 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         let line_height = last_layout.line_height;
         let line_number_width = last_layout.line_number_width;
         let range = self.range_from_utf16(&range_utf16);
+        let caret_height = last_layout
+            .line(self.text.offset_to_point(range.end).row)
+            .map_or(line_height, |line| line.row_height(line_height));
 
         let mut start_origin = None;
         let mut end_origin = None;
@@ -2974,7 +2986,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         Some(Bounds::from_corners(
             bounds.origin + line_number_origin + start_origin,
             // + line_height for show IME panel under the cursor line.
-            bounds.origin + line_number_origin + point(end_origin.x, end_origin.y + line_height),
+            bounds.origin + line_number_origin + point(end_origin.x, end_origin.y + caret_height),
         ))
     }
 

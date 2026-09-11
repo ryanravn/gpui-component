@@ -15,6 +15,7 @@ pub use super::text_wrapper::WrappingIndent;
 use super::text_wrapper::{LineItem, WrapDisplayPoint};
 use super::wrap_map::WrapMap;
 use super::{BufferPoint, DisplayPoint};
+use crate::input::EditorPresentation;
 use crate::input::Point as TreeSitterPoint;
 use crate::input::display_map::WrapPoint;
 use crate::input::rope_ext::RopeExt as _;
@@ -32,6 +33,22 @@ pub struct DisplayMap {
 }
 
 impl DisplayMap {
+    pub(crate) fn set_presentation(
+        &mut self,
+        presentation: EditorPresentation,
+        cx: &mut App,
+    ) -> bool {
+        if !self.wrap_map.set_presentation(presentation, cx) {
+            return false;
+        }
+        self.rebuild_fold_projection();
+        true
+    }
+
+    pub(crate) fn presentation(&self) -> &EditorPresentation {
+        self.wrap_map.wrapper().presentation()
+    }
+
     pub fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
         Self {
             wrap_map: WrapMap::new(font, font_size, wrap_width),
@@ -198,7 +215,7 @@ impl DisplayMap {
     /// Must be called with the OLD text (before replacement) and the edit range/new_text
     /// so we can compute which old lines were affected.
     pub fn adjust_folds_for_edit(&mut self, old_text: &Rope, range: &Range<usize>, new_text: &str) {
-        if self.fold_map.folded_ranges().is_empty() && self.fold_map.fold_candidates().is_empty() {
+        if !self.fold_map.hides_anything() && self.fold_map.fold_candidates().is_empty() {
             return;
         }
 
@@ -369,5 +386,49 @@ impl DisplayMap {
     #[inline]
     pub fn buffer_line_count(&self) -> usize {
         self.wrap_map.buffer_line_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn rendered_blocks_do_not_change_keyboard_folding_semantics(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let font = gpui::Font {
+                family: "Arial".into(),
+                weight: Default::default(),
+                style: Default::default(),
+                features: Default::default(),
+                fallbacks: None,
+            };
+            let mut map = DisplayMap::new(font, gpui::px(14.), None);
+            let text = Rope::from("0\n1\n2\n3\n4\n5\n6\n7");
+            map.set_text(&text, cx);
+            map.set_fold_candidates(vec![FoldRange::new(0, 3)]);
+            map.set_folded(0, true);
+            map.set_blocks(vec![4..6]);
+            assert!(map.is_buffer_line_hidden(1));
+            assert!(!map.block_hides_wrap_row(1));
+            assert!(map.block_hides_wrap_row(4));
+            assert_eq!(map.display_row_count(), 4);
+            map.clear_folds();
+            assert_eq!(map.display_row_count(), 6);
+            assert!(!map.is_buffer_line_hidden(1));
+            assert!(map.is_buffer_line_hidden(4));
+            map.set_blocks(Vec::new());
+            assert!(!map.block_hides_wrap_row(4));
+            assert_eq!(map.display_row_count(), 8);
+
+            map.set_blocks(vec![3..5]);
+            map.adjust_folds_for_edit(&text, &(0..0), "\n");
+            let changed = Rope::from(format!("\n{text}"));
+            map.on_text_changed(&changed, &(0..0), &Rope::from("\n"), cx);
+            assert!(!map.is_buffer_line_hidden(3));
+            assert!(map.is_buffer_line_hidden(4));
+            assert!(map.is_buffer_line_hidden(5));
+            assert!(!map.is_buffer_line_hidden(6));
+        });
     }
 }

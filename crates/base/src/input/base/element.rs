@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     InputBaseState, TextDecoration,
-    layout::{BlockPlacement, LastLayout, WhitespaceIndicators},
+    layout::{LastLayout, RowGeometry, WhitespaceIndicators},
     mode::LayoutMode,
 };
 
@@ -105,6 +105,17 @@ fn compose_decoration_collections<'a>(
     }
 
     (!styles.is_empty()).then_some(styles)
+}
+
+fn complete_highlights(
+    styles: Vec<(Range<usize>, HighlightStyle)>,
+    text_len: usize,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let styles = styles.into_iter().filter_map(|(range, style)| {
+        let range = range.start.min(text_len)..range.end.min(text_len);
+        (!range.is_empty()).then_some((range, style))
+    });
+    gpui::combine_highlights([(0..text_len, HighlightStyle::default())], styles).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -483,7 +494,7 @@ impl<M: InputModeKind> TextElement<M> {
         let visible_range = &last_layout.visible_range;
         let lines = &last_layout.lines;
         let line_number_width = last_layout.line_number_width;
-        let cursor_size = last_layout.cursor_size;
+        let mut cursor_size = last_layout.cursor_size;
         let cursor_width = cursor_size.width;
 
         let mut selected_range = state.selected_range;
@@ -496,6 +507,10 @@ impl<M: InputModeKind> TextElement<M> {
         let mut cursor = state.cursor();
         // Buffer rows from the raw (pre-mask) offsets, used to locate the cursor line.
         let cursor_row = state.text.offset_to_point(cursor).row;
+        let cursor_line_height = last_layout
+            .placement
+            .row_height(state.display_map.buffer_line_to_display_row(cursor_row));
+        cursor_size.height *= cursor_line_height / line_height;
         let sel_start_row = state.text.offset_to_point(selected_range.start).row;
         let sel_end_row = state.text.offset_to_point(selected_range.end).row;
         if state.masked {
@@ -519,7 +534,9 @@ impl<M: InputModeKind> TextElement<M> {
         let visible_buffer_lines = &last_layout.visible_buffer_lines;
         let caret_for = |row: usize, offset: usize, affinity: bool| -> Point<Pixels> {
             // y of the top of buffer line `row` in content space.
-            let top = line_height * state.display_map.buffer_line_to_display_row(row);
+            let top = last_layout
+                .placement
+                .y_of(state.display_map.buffer_line_to_display_row(row));
             let line_origin = point(px(0.), top);
 
             if let Some(vi) = visible_buffer_lines.iter().position(|&bl| bl == row) {
@@ -626,7 +643,7 @@ impl<M: InputModeKind> TextElement<M> {
             Some(Bounds::new(
                 point(
                     cursor_x,
-                    bounds.top() + cursor_pos.y + ((line_height - cursor_height) / 2.),
+                    bounds.top() + cursor_pos.y + ((cursor_line_height - cursor_height) / 2.),
                 ),
                 cursor_size,
             ))
@@ -634,6 +651,23 @@ impl<M: InputModeKind> TextElement<M> {
 
         if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
             scroll_offset = deferred_scroll_offset;
+        }
+        // Edits can replace entire blocks before their new heights have been
+        // measured. Correct a deferred estimate with this frame's geometry.
+        if !last_layout.placement.is_uniform()
+            && state.last_selected_range != Some(selected_range)
+            && !is_selected_all
+            && !state.auto_scroll.is_active()
+        {
+            if scroll_offset.y + cursor_pos.y + cursor_line_height
+                > bounds.size.height - top_bottom_margin
+            {
+                scroll_offset.y =
+                    bounds.size.height - top_bottom_margin - cursor_pos.y - cursor_line_height;
+            }
+            if scroll_offset.y + cursor_pos.y < top_bottom_margin {
+                scroll_offset.y = (top_bottom_margin - cursor_pos.y).min(px(0.));
+            }
         }
         scroll_offset.y = clamp_auto_grow_vertical_scroll_offset(
             &state.mode,
@@ -684,6 +718,7 @@ impl<M: InputModeKind> TextElement<M> {
         {
             offset_y += last_layout.block_space_at(index);
             let prev_lines_offset = *prev_lines_offset;
+            let line_height = line.row_height(line_height);
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
 
@@ -898,8 +933,7 @@ impl<M: InputModeKind> TextElement<M> {
     fn calculate_visible_range(
         &self,
         state: &InputBaseState<M>,
-        blocks: &BlockPlacement,
-        line_height: Pixels,
+        blocks: &RowGeometry,
         input_height: Pixels,
     ) -> (Range<usize>, Vec<usize>, Pixels) {
         // Add extra rows to avoid showing empty space when scroll to bottom.
@@ -908,7 +942,6 @@ impl<M: InputModeKind> TextElement<M> {
             return (0..1, vec![0], px(0.));
         }
 
-        let total_lines = state.display_map.wrap_row_count();
         let display_count = state.display_map.display_row_count();
         let buffer_line_count = state.display_map.buffer_line_count();
         if display_count == 0 || buffer_line_count == 0 {
@@ -923,21 +956,14 @@ impl<M: InputModeKind> TextElement<M> {
         scroll_top = clamp_auto_grow_vertical_scroll_offset(
             &state.mode,
             scroll_top,
-            line_height * total_lines + blocks.total(),
+            blocks.total(),
             input_height,
         );
 
-        // Display rows are uniformly `line_height` tall, except where a block
-        // stands between two of them, so the viewport maps through the
-        // placement rather than by division.
         let viewport_top = (-scroll_top).max(px(0.));
         let viewport_bottom = viewport_top + input_height;
-        let first_display = blocks
-            .row_at(viewport_top, line_height)
-            .min(display_count - 1);
-        let last_display = blocks
-            .row_at(viewport_bottom, line_height)
-            .min(display_count - 1);
+        let first_display = blocks.row_at(viewport_top).min(display_count - 1);
+        let last_display = blocks.row_at(viewport_bottom).min(display_count - 1);
 
         let start_line = state.display_map.display_row_to_buffer_line(first_display);
         let end_line = state.display_map.display_row_to_buffer_line(last_display);
@@ -947,8 +973,8 @@ impl<M: InputModeKind> TextElement<M> {
             .display_map
             .buffer_line_to_display_row_range(start_line)
         {
-            Some(range) => blocks.top_of(range.start, line_height),
-            None => blocks.top_of(first_display, line_height),
+            Some(range) => blocks.top_of(range.start),
+            None => blocks.top_of(first_display),
         };
 
         let visible_range = start_line..(end_line + 1 + extra_rows).min(buffer_line_count);
@@ -1207,7 +1233,7 @@ impl<M: InputModeKind> TextElement<M> {
                     });
                 }
 
-                offset_y += line.wrapped_lines.len() * last_layout.line_height;
+                offset_y += line.size(last_layout.line_height).height;
             }
 
             infos
@@ -1373,11 +1399,6 @@ impl<M: InputModeKind> TextElement<M> {
         }
 
         let mut lines = Vec::with_capacity(last_layout.visible_buffer_lines.len());
-        // run_offset tracks position in the runs vec coordinate space (only visible line bytes).
-        // This is separate from the visible_text offset because runs from highlight_lines
-        // only cover visible (non-folded) lines.
-        let mut run_offset = 0;
-
         for (vi, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
             let line_text: String = display_text.slice_line(buffer_line).into();
             let line_item = state
@@ -1386,11 +1407,18 @@ impl<M: InputModeKind> TextElement<M> {
                 .expect("line should exists in wrapper");
 
             debug_assert_eq!(line_item.len(), line_text.len());
+            let visible = line_item.projection.text(&line_text);
+            let font_size = line_item
+                .style
+                .as_ref()
+                .and_then(|style| style.font_size())
+                .unwrap_or(font_size);
 
             let mut wrapped_lines: SmallVec<[ShapedLine; 1]> = SmallVec::with_capacity(1);
 
             for range in &line_item.wrapped_lines {
-                let line_runs = runs_for_range(runs, run_offset, &range);
+                let line_runs =
+                    runs_for_range(runs, last_layout.visible_line_byte_offsets[vi], range);
                 let line_runs = if bg_segments.is_empty() {
                     line_runs
                 } else {
@@ -1401,7 +1429,21 @@ impl<M: InputModeKind> TextElement<M> {
                     )
                 };
 
-                let sub_line: SharedString = line_text[range.clone()].to_string().into();
+                let mut line_runs = line_item.projection.runs(line_runs, range.start);
+                if let Some(weight) = line_item
+                    .style
+                    .as_ref()
+                    .and_then(|style| style.font_weight())
+                {
+                    for run in &mut line_runs {
+                        if run.font.weight < weight {
+                            run.font.weight = weight;
+                        }
+                    }
+                }
+                let visible_range = line_item.projection.display_offset(range.start)
+                    ..line_item.projection.display_offset(range.end);
+                let sub_line: SharedString = visible[visible_range].to_string().into();
                 let shaped_line = window
                     .text_system()
                     .shape_line(sub_line, font_size, &line_runs, None);
@@ -1411,11 +1453,11 @@ impl<M: InputModeKind> TextElement<M> {
 
             // Use the first visual line's indentation width for continuation lines.
             let wrap_indent = if line_item.indent > 0 && wrapped_lines.len() > 1 {
-                let indent_byte_len = line_text
+                let indent_byte_len = visible
                     .char_indices()
                     .nth(line_item.indent as usize)
                     .map(|(ix, _)| ix)
-                    .unwrap_or(line_text.len());
+                    .unwrap_or(visible.len());
                 wrapped_lines[0].x_for_index(indent_byte_len)
             } else {
                 px(0.)
@@ -1424,11 +1466,15 @@ impl<M: InputModeKind> TextElement<M> {
             let line_layout = LineLayout::new()
                 .lines(wrapped_lines)
                 .wrap_indent(wrap_indent)
+                .with_projection(line_item.projection.clone())
+                .with_row_height(
+                    line_item
+                        .style
+                        .as_ref()
+                        .and_then(|style| style.line_height()),
+                )
                 .with_whitespaces(whitespace_indicators.clone());
             lines.push(line_layout);
-
-            // +1 for the `\n`
-            run_offset += line_text.len() + 1;
         }
 
         lines
@@ -1804,18 +1850,34 @@ impl<M: InputModeKind> Element for TextElement<M> {
             });
         }
         laid_out.sort_by_key(|block| block.display_row);
-        let placement = BlockPlacement::new(
+        let state = self.state.read(cx);
+        let line_height = window.line_height();
+        let styled_rows = state
+            .display_map
+            .presentation()
+            .line_styles()
+            .iter()
+            .flat_map(|style| {
+                style.lines().filter_map(|line| {
+                    state
+                        .display_map
+                        .buffer_line_to_display_row_range(line)
+                        .map(|rows| (rows, style.line_height().unwrap_or(line_height)))
+                })
+            })
+            .collect();
+        let placement = RowGeometry::new(
+            line_height,
+            state.display_map.display_row_count(),
             laid_out
                 .iter()
                 .map(|block| (block.display_row, block.height))
                 .collect(),
+            styled_rows,
         );
 
-        let state = self.state.read(cx);
-        let line_height = window.line_height();
-
         let (visible_range, visible_buffer_lines, visible_top) =
-            self.calculate_visible_range(&state, &placement, line_height, bounds.size.height);
+            self.calculate_visible_range(&state, &placement, bounds.size.height);
         let visible_start_offset = state.text.line_start_offset(visible_range.start);
         let visible_end_offset = state
             .text
@@ -1866,7 +1928,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
             visible_buffer_lines,
             visible_line_byte_offsets,
             block_space,
-            visible_display_rows,
             placement: placement.clone(),
             visible_top,
             visible_range_offset,
@@ -1909,6 +1970,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
         );
 
         let runs = if let (false, Some(highlight_styles)) = (is_empty, highlight_styles) {
+            // Styling keeps source offsets even when folds or blocks hide
+            // lines between visible runs. Filling the gaps preserves those
+            // offsets without allocating or shaping the hidden text.
+            let highlight_styles = complete_highlights(highlight_styles, display_text.len());
             let mut runs = Vec::with_capacity(highlight_styles.len() + 2);
 
             for (range, style) in &highlight_styles {
@@ -1989,7 +2054,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let ghost_line_count = ghost_lines.len();
         let ghost_lines_height = ghost_line_count as f32 * line_height;
 
-        let total_wrapped_lines = state.display_map.wrap_row_count();
         let empty_bottom_height = empty_bottom_height(
             state.is_code_editor(),
             state.scroll_beyond_last_line,
@@ -2006,10 +2070,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             } else {
                 longest_line_width
             },
-            (total_wrapped_lines as f32 * line_height
-                + placement.total()
-                + empty_bottom_height.max(ghost_lines_height))
-            .max(bounds.size.height),
+            (placement.total() + empty_bottom_height.max(ghost_lines_height))
+                .max(bounds.size.height),
         );
 
         // TODO: should be add some gap to right, to convenient to focus on boundary position
@@ -2065,42 +2127,30 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds, cx);
 
-        // An element may only prepaint in this phase, so the blocks are placed
-        // here rather than while painting, walking the rows the same way the
-        // paint loop does.
+        // Position blocks from document coordinates, including when the
+        // viewport contains only blocks or ends before the next source line.
         {
             let block_x = bounds.origin.x + line_number_width;
-            let mut offset_y = last_layout.visible_top;
-            let mut next_block = 0;
-            for (index, line) in last_layout.lines.iter().enumerate() {
-                let display_row = last_layout.visible_display_rows[index];
-                while laid_out
-                    .get(next_block)
-                    .is_some_and(|block| block.display_row < display_row)
-                {
-                    next_block += 1;
+            let mut previous_row = None;
+            let mut stacked = px(0.);
+            for block in &mut laid_out {
+                if previous_row != Some(block.display_row) {
+                    stacked = px(0.);
+                    previous_row = Some(block.display_row);
                 }
-                while let Some(block) = laid_out.get_mut(next_block) {
-                    if block.display_row != display_row {
-                        break;
-                    }
-                    block.element.prepaint_at(
-                        point(block_x, bounds.origin.y + offset_y),
-                        window,
-                        cx,
+                let y = bounds.origin.y + placement.top_of(block.display_row) + stacked;
+                if y + block.height >= input_bounds.top() && y <= input_bounds.bottom() {
+                    window.with_content_mask(
+                        Some(ContentMask {
+                            bounds: input_bounds,
+                        }),
+                        |window| {
+                            block.element.prepaint_at(point(block_x, y), window, cx);
+                        },
                     );
                     block.placed = true;
-                    offset_y += block.height;
-                    next_block += 1;
                 }
-                offset_y += line.size(line_height).height;
-            }
-            for block in laid_out.iter_mut().skip(next_block) {
-                block
-                    .element
-                    .prepaint_at(point(block_x, bounds.origin.y + offset_y), window, cx);
-                block.placed = true;
-                offset_y += block.height;
+                stacked += block.height;
             }
         }
 
@@ -2267,6 +2317,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     .enumerate()
                 {
                     offset_y += prepaint.last_layout.block_space_at(index);
+                    let line_height = prepaint.last_layout.lines[index].row_height(line_height);
                     let is_active = prepaint.current_row == Some(buffer_line);
                     let p = point(input_bounds.origin.x, origin.y + offset_y);
                     let height = line_height * lines.len() as f32;
@@ -2432,6 +2483,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .enumerate()
             {
                 offset_y += prepaint.last_layout.block_space_at(index);
+                let line_height = prepaint.last_layout.lines[index].row_height(line_height);
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let is_active = prepaint.current_row == Some(buffer_line);
 
@@ -2471,6 +2523,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         self.state.update(cx, |state, cx| {
             state.last_layout = Some(prepaint.last_layout.clone());
+            if let Some(layout) = &mut state.last_layout {
+                layout.cursor_bounds = prepaint.cursor_bounds_with_scroll();
+            }
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
             state.set_input_bounds(input_bounds, cx);
@@ -2678,6 +2733,39 @@ fn split_runs_by_bg_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn styling_after_hidden_lines_keeps_unicode_source_boundaries() {
+        let text = "above\n| hidden 🌲 |\nParagraph **bold** with æøå 日本語.";
+        let paragraph = text.find("Paragraph").expect("paragraph");
+        let bold = text.find("bold").expect("bold");
+        let style = HighlightStyle {
+            font_weight: Some(gpui::FontWeight::BOLD),
+            ..Default::default()
+        };
+        let styles = complete_highlights(vec![(bold..bold + 4, style)], text.len());
+        let runs: Vec<_> = styles
+            .into_iter()
+            .map(|(range, style)| {
+                gpui::TextStyle::default()
+                    .highlight(style)
+                    .to_run(range.len())
+            })
+            .collect();
+        let runs = runs_for_range(&runs, paragraph, &(0..text.len() - paragraph));
+        let mut offset = 0;
+        for run in &runs {
+            assert!(text[paragraph..].is_char_boundary(offset));
+            if run.font.weight == gpui::FontWeight::BOLD {
+                assert_eq!(
+                    &text[paragraph + offset..paragraph + offset + run.len],
+                    "bold"
+                );
+            }
+            offset += run.len;
+        }
+        assert_eq!(offset, text.len() - paragraph);
+    }
 
     #[test]
     fn test_plain_text_decorations_include_unstyled_gaps() {

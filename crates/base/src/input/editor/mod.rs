@@ -2,7 +2,7 @@ use gpui::{
     App, Context, Div, Entity, InteractiveElement as _, IntoElement, RenderOnce, Stateful, Window,
 };
 
-use super::{EditorMode, InputBaseState, InputBlock, InputModeKind};
+use super::{EditorMode, EditorPresentation, InputBaseState, InputBlock, InputModeKind};
 
 /// State for source-code editing.
 ///
@@ -13,6 +13,21 @@ use super::{EditorMode, InputBaseState, InputBlock, InputModeKind};
 pub type EditorState = InputBaseState<EditorMode>;
 
 impl EditorState {
+    /// Set concealment and line typography without changing the document.
+    pub fn set_text_presentation(
+        &mut self,
+        presentation: EditorPresentation,
+        cx: &mut Context<Self>,
+    ) {
+        if self.display_map.set_presentation(presentation, cx) {
+            cx.notify();
+        }
+    }
+
+    pub fn text_presentation(&self) -> &EditorPresentation {
+        self.display_map.presentation()
+    }
+
     /// Draw an element in place of each of these line ranges.
     ///
     /// The lines stay in the buffer: only their drawing is replaced, so a

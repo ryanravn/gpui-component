@@ -10,11 +10,13 @@
 mod display_map;
 mod fold_map;
 mod folding;
+mod projection;
 mod text_wrapper;
 mod wrap_map;
 
 // Re-export public API
 pub use self::display_map::{DisplayMap, WrappingIndent};
+pub(crate) use self::projection::TextProjection;
 pub(crate) use self::text_wrapper::LineLayout;
 
 // Re-export FoldRange and extract_fold_ranges

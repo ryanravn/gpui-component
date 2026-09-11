@@ -45,6 +45,8 @@ mod mode;
 mod movement;
 #[path = "base/native.rs"]
 mod native;
+#[path = "editor/presentation.rs"]
+mod presentation;
 #[path = "base/rope_ext.rs"]
 mod rope_ext;
 #[path = "editor/search.rs"]
@@ -92,6 +94,7 @@ pub use mask_pattern::MaskPattern;
 #[doc(hidden)]
 pub use native::set_text_content_type;
 pub use native::{NativeMenu, NativeMenuItem};
+pub use presentation::{EditorLineStyle, EditorPresentation};
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
 pub use search::{SearchMatcher, SearchSession};
