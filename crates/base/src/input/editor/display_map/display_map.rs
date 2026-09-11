@@ -134,6 +134,27 @@ impl DisplayMap {
         self.rebuild_fold_projection();
     }
 
+    /// Hide the given buffer line ranges so the caller can draw something in
+    /// their place. Returns whether the set changed.
+    pub fn set_blocks(&mut self, blocks: Vec<Range<usize>>) -> bool {
+        if !self.fold_map.set_blocks(blocks) {
+            return false;
+        }
+        self.rebuild_fold_projection();
+        true
+    }
+
+    /// Whether a block, rather than a fold, hides this wrap row.
+    pub fn block_hides_wrap_row(&self, wrap_row: usize) -> bool {
+        self.fold_map.block_hides_wrap_row(wrap_row)
+    }
+
+    /// The display row a block hidden at this buffer line is drawn before.
+    pub fn block_display_row(&self, line: usize) -> usize {
+        let wrap_row = self.wrap_map.buffer_line_to_first_wrap_row(line);
+        self.fold_map.display_row_before(wrap_row)
+    }
+
     /// Set a fold at the given start_line (must be in candidates)
     pub fn set_folded(&mut self, start_line: usize, folded: bool) {
         self.fold_map.set_folded(start_line, folded);

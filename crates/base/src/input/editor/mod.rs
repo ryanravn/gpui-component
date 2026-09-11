@@ -1,6 +1,8 @@
-use gpui::{App, Div, Entity, InteractiveElement as _, IntoElement, RenderOnce, Stateful, Window};
+use gpui::{
+    App, Context, Div, Entity, InteractiveElement as _, IntoElement, RenderOnce, Stateful, Window,
+};
 
-use super::{EditorMode, InputBaseState, InputModeKind};
+use super::{EditorMode, InputBaseState, InputBlock, InputModeKind};
 
 /// State for source-code editing.
 ///
@@ -9,6 +11,23 @@ use super::{EditorMode, InputBaseState, InputModeKind};
 /// providers exist on this kind only, so an ordinary input or textarea never
 /// exposes them.
 pub type EditorState = InputBaseState<EditorMode>;
+
+impl EditorState {
+    /// Draw an element in place of each of these line ranges.
+    ///
+    /// The lines stay in the buffer: only their drawing is replaced, so a
+    /// selection, an undo or a backspace crossing them behaves as it always
+    /// did. Setting the same ranges again is free, which is what lets a caller
+    /// re-supply them on every change.
+    pub fn set_blocks(&mut self, blocks: Vec<InputBlock>, cx: &mut Context<Self>) {
+        let ranges = blocks.iter().map(|block| block.lines.clone()).collect();
+        let changed = self.display_map.set_blocks(ranges);
+        self.blocks = blocks;
+        if changed {
+            cx.notify();
+        }
+    }
+}
 
 impl InputModeKind for EditorMode {
     const MULTI_LINE: bool = true;

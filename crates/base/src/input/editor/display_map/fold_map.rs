@@ -6,6 +6,7 @@
 /// - Handling fold state changes and rebuilding the projection
 use super::folding::FoldRange;
 use super::wrap_map::WrapMap;
+use std::ops::Range;
 
 /// FoldMap projects wrap rows to display rows by hiding folded regions.
 pub(super) struct FoldMap {
@@ -25,6 +26,18 @@ pub(super) struct FoldMap {
     /// Subset of candidates, sorted by start_line
     folded: Vec<FoldRange>,
 
+    /// Buffer line ranges the caller draws something else in place of.
+    ///
+    /// A fold keeps its first and last line on screen because the point of it
+    /// is to see what was collapsed. A block hides every line it covers: what
+    /// stands there instead is an element the caller paints, so leaving a line
+    /// behind would draw the source twice.
+    blocks: Vec<Range<usize>>,
+
+    /// Wrap rows the blocks hide, from the last rebuild. A cursor may step
+    /// into these; the rows a fold hides it steps over.
+    block_wrap_rows: Vec<Range<usize>>,
+
     /// Flag indicating if the fold projection needs rebuilding
     /// Used for lazy evaluation to avoid expensive rebuilds on every text change
     needs_rebuild: bool,
@@ -41,9 +54,28 @@ impl FoldMap {
             wrap_row_to_display_row: Vec::new(),
             candidates: Vec::new(),
             folded: Vec::new(),
+            blocks: Vec::new(),
+            block_wrap_rows: Vec::new(),
             needs_rebuild: true,
             cached_wrap_row_count: 0,
         }
+    }
+
+    /// Replace the hidden block ranges. Returns whether anything changed.
+    pub(super) fn set_blocks(&mut self, mut blocks: Vec<Range<usize>>) -> bool {
+        blocks.retain(|block| block.start < block.end);
+        blocks.sort_by_key(|block| block.start);
+        if blocks == self.blocks {
+            return false;
+        }
+        self.blocks = blocks;
+        self.needs_rebuild = true;
+        true
+    }
+
+    #[inline]
+    fn nothing_hidden(&self) -> bool {
+        self.folded.is_empty() && self.blocks.is_empty()
     }
 
     /// Update cached wrap_row_count without full rebuild.
@@ -55,7 +87,7 @@ impl FoldMap {
 
     /// Get total number of visible display rows
     pub(super) fn display_row_count(&self) -> usize {
-        if self.folded.is_empty() {
+        if self.nothing_hidden() {
             return self.cached_wrap_row_count;
         }
         self.visible_wrap_rows.len()
@@ -64,7 +96,7 @@ impl FoldMap {
     /// Convert wrap_row to display_row
     /// Returns None if the wrap_row is hidden by folding
     pub(super) fn wrap_row_to_display_row(&self, wrap_row: usize) -> Option<usize> {
-        if self.folded.is_empty() {
+        if self.nothing_hidden() {
             return if wrap_row < self.cached_wrap_row_count {
                 Some(wrap_row)
             } else {
@@ -79,7 +111,7 @@ impl FoldMap {
 
     /// Convert display_row to wrap_row
     pub(super) fn display_row_to_wrap_row(&self, display_row: usize) -> Option<usize> {
-        if self.folded.is_empty() {
+        if self.nothing_hidden() {
             return if display_row < self.cached_wrap_row_count {
                 Some(display_row)
             } else {
@@ -91,7 +123,7 @@ impl FoldMap {
 
     /// Find the nearest visible display_row for a given wrap_row
     pub(super) fn nearest_visible_display_row(&self, wrap_row: usize) -> usize {
-        if self.folded.is_empty() {
+        if self.nothing_hidden() {
             return wrap_row.min(self.cached_wrap_row_count.saturating_sub(1));
         }
 
@@ -103,6 +135,23 @@ impl FoldMap {
             Ok(idx) => idx,
             Err(insert_pos) => insert_pos.saturating_sub(1),
         }
+    }
+
+    /// Whether a block, rather than a fold, hides this wrap row.
+    pub(super) fn block_hides_wrap_row(&self, wrap_row: usize) -> bool {
+        self.block_wrap_rows
+            .iter()
+            .any(|range| range.contains(&wrap_row))
+    }
+
+    /// How many display rows come before this wrap row, which is where a
+    /// block hidden at that row is drawn.
+    pub(super) fn display_row_before(&self, wrap_row: usize) -> usize {
+        if self.nothing_hidden() {
+            return wrap_row.min(self.cached_wrap_row_count);
+        }
+        self.visible_wrap_rows
+            .partition_point(|&row| row < wrap_row)
     }
 
     /// Set fold candidates (from tree-sitter/LSP), full replacement.
@@ -237,6 +286,19 @@ impl FoldMap {
             }
         }
 
+        if !self.blocks.is_empty() {
+            self.blocks
+                .retain(|block| !(block.start <= edit_end_line && block.end > edit_start_line));
+            if line_delta != 0 {
+                for block in &mut self.blocks {
+                    if block.start > edit_end_line {
+                        block.start = (block.start as isize + line_delta).max(0) as usize;
+                        block.end = (block.end as isize + line_delta).max(0) as usize;
+                    }
+                }
+            }
+        }
+
         self.needs_rebuild = true;
     }
 
@@ -256,8 +318,8 @@ impl FoldMap {
         self.visible_wrap_rows.clear();
         self.wrap_row_to_display_row = vec![None; wrap_row_count];
 
-        if self.folded.is_empty() {
-            // Fast path: no folds, all wrap rows are visible
+        if self.nothing_hidden() {
+            // Fast path: nothing hidden, all wrap rows are visible
             self.visible_wrap_rows = (0..wrap_row_count).collect();
             for (display_row, &wrap_row) in self.visible_wrap_rows.iter().enumerate() {
                 self.wrap_row_to_display_row[wrap_row] = Some(display_row);
@@ -268,6 +330,19 @@ impl FoldMap {
 
         // Build set of hidden wrap_row ranges from folded buffer lines
         let mut hidden_ranges = Vec::new();
+        self.block_wrap_rows.clear();
+        for block in &self.blocks {
+            let start_wrap_row = wrap_map.buffer_line_to_first_wrap_row(block.start);
+            let end_wrap_row = if block.end < wrap_map.buffer_line_count() {
+                wrap_map.buffer_line_to_first_wrap_row(block.end)
+            } else {
+                wrap_row_count
+            };
+            if start_wrap_row < end_wrap_row {
+                self.block_wrap_rows.push(start_wrap_row..end_wrap_row);
+                hidden_ranges.push(start_wrap_row..end_wrap_row);
+            }
+        }
         for fold in &self.folded {
             // Hide wrap rows from (start_line + 1) to (end_line - 1) (inclusive)
             // Both the first line and last line of the fold remain visible
@@ -287,6 +362,7 @@ impl FoldMap {
             };
 
             if start_wrap_row < end_wrap_row {
+                self.block_wrap_rows.push(start_wrap_row..end_wrap_row);
                 hidden_ranges.push(start_wrap_row..end_wrap_row);
             }
         }

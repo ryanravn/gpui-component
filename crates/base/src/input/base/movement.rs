@@ -90,10 +90,27 @@ impl<M: InputModeKind> InputBaseState<M> {
         let target_display_row = current_display_row
             .saturating_add_signed(move_lines)
             .min(max_display_row);
-        let target_wrap_row = self
+        let mut target_wrap_row = self
             .display_map
             .display_row_to_wrap_row(target_display_row)
             .unwrap_or(display_point.row);
+
+        // A fold is something the reader chose to collapse, so the cursor
+        // steps over it. A block is the same line drawn another way, so one
+        // step of the arrow key lands IN it: the caller sees the selection
+        // arrive and draws that block as source again.
+        if move_lines.abs() == 1 {
+            let stepped = if move_lines > 0 {
+                Some(display_point.row + 1)
+            } else {
+                display_point.row.checked_sub(1)
+            };
+            if let Some(row) = stepped {
+                if self.display_map.block_hides_wrap_row(row) {
+                    target_wrap_row = row;
+                }
+            }
+        }
 
         display_point.row = target_wrap_row;
         display_point.column = 0;

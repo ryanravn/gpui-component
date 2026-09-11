@@ -4,11 +4,12 @@
 //! https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs
 use gpui::TextAlign;
 use gpui::{
-    Action, App, AppContext, Bounds, ClipboardItem, Context, Edges, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    Action, AnyElement, App, AppContext, Bounds, ClipboardItem, Context, Edges, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement as _, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString,
+    Styled as _, Subscription, UTF16Selection, Window, actions, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
@@ -108,6 +109,19 @@ actions!(
         GoToDefinition,
     ]
 );
+
+/// An element the input draws in place of a range of its own lines.
+///
+/// The buffer still holds those lines and every edit, selection and undo runs
+/// over them unchanged: what the block replaces is how they are DRAWN, which
+/// is what a note needs to show a table as a table while the source of it is
+/// still the thing being edited. The closure is called each time the input
+/// lays out, because an element belongs to one frame.
+#[derive(Clone)]
+pub struct InputBlock {
+    pub lines: Range<usize>,
+    pub render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+}
 
 #[derive(Clone)]
 pub enum InputEvent {
@@ -286,6 +300,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) mode: LayoutMode,
     pub(super) text: Rope,
     pub(super) display_map: DisplayMap,
+    /// Elements drawn in place of the lines they cover. See [`InputBlock`].
+    pub(super) blocks: Vec<InputBlock>,
     pub(super) undo_manager: UndoManager,
     pub(super) search_session: super::SearchSession,
     pub(super) searchable: bool,
@@ -594,6 +610,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             focus_handle: focus_handle.clone(),
             text: "".into(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
+            blocks: Vec::new(),
             search_session: super::SearchSession::default(),
             searchable: false,
             replaceable: true,
@@ -784,6 +801,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let mut y_offset = last_layout.visible_top;
         for (vi, line) in last_layout.lines.iter().enumerate() {
+            y_offset += last_layout.block_space_at(vi);
             let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
             let local_offset = offset.saturating_sub(prev_lines_offset);
             if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
@@ -1836,7 +1854,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         let row = point.row;
 
         // Calculate row offset by multiplying the number of lines before it with the line height
-        let mut row_offset_y = line_height * self.display_map.buffer_line_to_display_row(row);
+        let mut row_offset_y = last_layout.placement.y_of(
+            self.display_map.buffer_line_to_display_row(row),
+            line_height,
+        );
 
         // For Right alignment use 0 margin: the cursor indicator is clamped inside bounds
         // in layout_cursor, so shifting the text here would cause a first-click visual jump.
@@ -2127,6 +2148,10 @@ impl<M: InputModeKind> InputBaseState<M> {
             .enumerate()
         {
             let line_start_offset = last_layout.visible_line_byte_offsets[vi];
+
+            // A block drawn before this line stands between the pointer and
+            // the text, so what is over the block belongs to the line below.
+            y_offset += last_layout.block_space_at(vi);
 
             // Calculate line origin for this display row
             let line_origin = point(px(0.), y_offset);
@@ -2916,6 +2941,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             }
 
             let index_offset = last_layout.visible_line_byte_offsets[vi];
+            y_offset += last_layout.block_space_at(vi);
 
             if start_origin.is_none() {
                 if let Some(p) = line.position_for_index(

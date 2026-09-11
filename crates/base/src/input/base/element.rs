@@ -2,8 +2,8 @@ use crate::input::{InputExtras as _, InputModeKind};
 use gpui::Corners;
 use gpui::Half;
 use gpui::{
-    AnyElement, App, Bounds, ContentMask, Edges, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, Edges, Element, ElementId,
+    ElementInputHandler, Entity, GlobalElementId,
 };
 use gpui::{
     HighlightStyle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, LayoutId,
@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     InputBaseState, TextDecoration,
-    layout::{LastLayout, WhitespaceIndicators},
+    layout::{BlockPlacement, LastLayout, WhitespaceIndicators},
     mode::LayoutMode,
 };
 
@@ -407,6 +407,14 @@ pub(super) struct TextElement<M: InputModeKind> {
     placeholder: SharedString,
 }
 
+/// A block after layout: the element, the display row it stands before and
+/// how tall it turned out.
+struct LaidOutBlock {
+    element: AnyElement,
+    display_row: usize,
+    height: Pixels,
+}
+
 impl<M: InputModeKind> TextElement<M> {
     pub(super) fn new(state: Entity<InputBaseState<M>>) -> Self {
         Self {
@@ -664,11 +672,13 @@ impl<M: InputModeKind> TextElement<M> {
         let mut line_corners = vec![];
 
         // Iterate only over visible (non-hidden) buffer lines
-        for (prev_lines_offset, line) in last_layout
+        for (index, (prev_lines_offset, line)) in last_layout
             .visible_line_byte_offsets
             .iter()
             .zip(lines.iter())
+            .enumerate()
         {
+            offset_y += last_layout.block_space_at(index);
             let prev_lines_offset = *prev_lines_offset;
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
@@ -884,6 +894,7 @@ impl<M: InputModeKind> TextElement<M> {
     fn calculate_visible_range(
         &self,
         state: &InputBaseState<M>,
+        blocks: &BlockPlacement,
         line_height: Pixels,
         input_height: Pixels,
     ) -> (Range<usize>, Vec<usize>, Pixels) {
@@ -908,19 +919,21 @@ impl<M: InputModeKind> TextElement<M> {
         scroll_top = clamp_auto_grow_vertical_scroll_offset(
             &state.mode,
             scroll_top,
-            line_height * total_lines,
+            line_height * total_lines + blocks.total(),
             input_height,
         );
 
-        // Display rows are uniformly `line_height` tall, so the visible window maps
-        // directly to a display-row range.
+        // Display rows are uniformly `line_height` tall, except where a block
+        // stands between two of them, so the viewport maps through the
+        // placement rather than by division.
         let viewport_top = (-scroll_top).max(px(0.));
         let viewport_bottom = viewport_top + input_height;
-        let line_height_f = f32::from(line_height);
-        let first_display =
-            ((f32::from(viewport_top) / line_height_f).floor() as usize).min(display_count - 1);
-        let last_display =
-            ((f32::from(viewport_bottom) / line_height_f).ceil() as usize).min(display_count - 1);
+        let first_display = blocks
+            .row_at(viewport_top, line_height)
+            .min(display_count - 1);
+        let last_display = blocks
+            .row_at(viewport_bottom, line_height)
+            .min(display_count - 1);
 
         let start_line = state.display_map.display_row_to_buffer_line(first_display);
         let end_line = state.display_map.display_row_to_buffer_line(last_display);
@@ -930,8 +943,8 @@ impl<M: InputModeKind> TextElement<M> {
             .display_map
             .buffer_line_to_display_row_range(start_line)
         {
-            Some(range) => line_height * range.start,
-            None => line_height * first_display,
+            Some(range) => blocks.top_of(range.start, line_height),
+            None => blocks.top_of(first_display, line_height),
         };
 
         let visible_range = start_line..(end_line + 1 + extra_rows).min(buffer_line_count);
@@ -1173,11 +1186,13 @@ impl<M: InputModeKind> TextElement<M> {
             let mut infos = Vec::with_capacity(last_layout.visible_buffer_lines.len());
             let mut offset_y = last_layout.visible_top;
 
-            for (line, &buffer_line) in last_layout
+            for (index, (line, &buffer_line)) in last_layout
                 .lines
                 .iter()
                 .zip(last_layout.visible_buffer_lines.iter())
+                .enumerate()
             {
+                offset_y += last_layout.block_space_at(index);
                 if state.display_map.is_fold_candidate(buffer_line) {
                     let is_folded = state.display_map.is_folded_at(buffer_line);
                     infos.push(FoldInfo {
@@ -1579,6 +1594,8 @@ pub(super) struct PrepaintState {
     content_bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
+    /// Elements drawn in place of the lines they hide, in row order.
+    blocks: Vec<LaidOutBlock>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
     ghost_lines: Vec<ShapedLine>,
@@ -1751,11 +1768,49 @@ impl<M: InputModeKind> Element for TextElement<M> {
             });
         }
 
+        // Blocks are measured before anything asks where a row sits, because
+        // every y below this point counts the ones standing above it. All of
+        // them are measured rather than only the visible ones: the height of a
+        // block off screen is what puts the rows after it in the right place.
+        let content_width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(0.));
+        let sources = self.state.read(cx).blocks.clone();
+        let mut laid_out: Vec<LaidOutBlock> = Vec::with_capacity(sources.len());
+        for block in sources {
+            let mut element = (block.render)(window, cx);
+            let height = element
+                .layout_as_root(
+                    size(
+                        AvailableSpace::Definite(content_width),
+                        AvailableSpace::MinContent,
+                    ),
+                    window,
+                    cx,
+                )
+                .height;
+            let display_row = self
+                .state
+                .read(cx)
+                .display_map
+                .block_display_row(block.lines.start);
+            laid_out.push(LaidOutBlock {
+                element,
+                display_row,
+                height,
+            });
+        }
+        laid_out.sort_by_key(|block| block.display_row);
+        let placement = BlockPlacement::new(
+            laid_out
+                .iter()
+                .map(|block| (block.display_row, block.height))
+                .collect(),
+        );
+
         let state = self.state.read(cx);
         let line_height = window.line_height();
 
         let (visible_range, visible_buffer_lines, visible_top) =
-            self.calculate_visible_range(&state, line_height, bounds.size.height);
+            self.calculate_visible_range(&state, &placement, line_height, bounds.size.height);
         let visible_start_offset = state.text.line_start_offset(visible_range.start);
         let visible_end_offset = state
             .text
@@ -1792,10 +1847,22 @@ impl<M: InputModeKind> Element for TextElement<M> {
             )
         };
 
+        let visible_display_rows: Vec<usize> = visible_buffer_lines
+            .iter()
+            .map(|&line| state.display_map.buffer_line_to_display_row(line))
+            .collect();
+        let block_space: Vec<Pixels> = visible_display_rows
+            .iter()
+            .map(|&row| placement.space_at(row))
+            .collect();
+
         let mut last_layout = LastLayout {
             visible_range,
             visible_buffer_lines,
             visible_line_byte_offsets,
+            block_space,
+            visible_display_rows,
+            placement: placement.clone(),
             visible_top,
             visible_range_offset,
             line_height,
@@ -1935,6 +2002,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 longest_line_width
             },
             (total_wrapped_lines as f32 * line_height
+                + placement.total()
                 + empty_bottom_height.max(ghost_lines_height))
             .max(bounds.size.height),
         );
@@ -2086,6 +2154,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
+            blocks: laid_out,
         }
     }
 
@@ -2148,10 +2217,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 offset_y += invisible_top_padding;
 
                 // Each item is the normal lines.
-                for (lines, &buffer_line) in line_numbers
+                for (index, (lines, &buffer_line)) in line_numbers
                     .iter()
                     .zip(prepaint.last_layout.visible_buffer_lines.iter())
+                    .enumerate()
                 {
+                    offset_y += prepaint.last_layout.block_space_at(index);
                     let is_active = prepaint.current_row == Some(buffer_line);
                     let p = point(input_bounds.origin.x, origin.y + offset_y);
                     let height = line_height * lines.len() as f32;
@@ -2219,13 +2290,38 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 px(0.)
             };
 
-            for (line, &buffer_line) in prepaint
+            let mut blocks = std::mem::take(&mut prepaint.blocks);
+            let mut next_block = 0;
+            let block_x = origin.x + prepaint.last_layout.line_number_width;
+            for (index, (line, &buffer_line)) in prepaint
                 .last_layout
                 .lines
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
+                .enumerate()
             {
                 let row = buffer_line;
+                let display_row = prepaint.last_layout.visible_display_rows[index];
+                // Blocks above the window were measured for the rows they
+                // move, not to be drawn; the ones at this row are drawn now,
+                // in the space the line layout left for them.
+                while blocks
+                    .get(next_block)
+                    .is_some_and(|block| block.display_row < display_row)
+                {
+                    next_block += 1;
+                }
+                while let Some(block) = blocks.get_mut(next_block) {
+                    if block.display_row != display_row {
+                        break;
+                    }
+                    block
+                        .element
+                        .prepaint_at(point(block_x, origin.y + offset_y), window, cx);
+                    block.element.paint(window, cx);
+                    offset_y += block.height;
+                    next_block += 1;
+                }
                 let line_y = origin.y + offset_y;
                 let p = point(
                     origin.x + prepaint.last_layout.line_number_width + (scroll_offset),
@@ -2278,6 +2374,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 }
             }
 
+            // A note that ends in a rendered block has no line after it to
+            // hang the block on, so what is left over is drawn here.
+            for block in blocks.iter_mut().skip(next_block) {
+                block
+                    .element
+                    .prepaint_at(point(block_x, origin.y + offset_y), window, cx);
+                block.element.paint(window, cx);
+                offset_y += block.height;
+            }
+
             // Paint blinking cursor
             if focused && show_cursor {
                 if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
@@ -2305,10 +2411,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window.paint_quad(fill(gutter_bounds, gutter_bg));
 
             // Each item is the normal lines.
-            for (lines, &buffer_line) in line_numbers
+            for (index, (lines, &buffer_line)) in line_numbers
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
+                .enumerate()
             {
+                offset_y += prepaint.last_layout.block_space_at(index);
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let is_active = prepaint.current_row == Some(buffer_line);
 

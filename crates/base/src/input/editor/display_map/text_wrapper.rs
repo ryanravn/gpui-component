@@ -1132,6 +1132,9 @@ mod tests {
         ]);
 
         let last_layout = LastLayout {
+            block_space: Vec::new(),
+            visible_display_rows: Vec::new(),
+            placement: Default::default(),
             visible_range: 0..1,
             visible_buffer_lines: vec![0],
             visible_line_byte_offsets: vec![0],
@@ -1337,6 +1340,9 @@ mod tests {
         line_layout = line_layout.wrap_indent(px(20.0));
 
         let last_layout = LastLayout {
+            block_space: Vec::new(),
+            visible_display_rows: Vec::new(),
+            placement: Default::default(),
             visible_range: 0..1,
             visible_buffer_lines: vec![0],
             visible_line_byte_offsets: vec![0],
